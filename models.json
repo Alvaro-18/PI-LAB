@@ -1,0 +1,6 @@
+{
+  "_nota": "Modelos que cabem em um Mac de 8 GB (quantização padrão do Ollama, ~Q4). Tamanhos aproximados: confira com `ollama list`. Reasoning models (qwen3, deepseek-r1) ficaram de fora porque gastam os tokens pensando.",
+  "core": ["llama3.2:3b", "phi3:mini", "qwen2.5:3b"],
+  "extra": ["llama3.2:1b", "qwen2.5:1.5b", "gemma3:4b", "phi4-mini", "gemma2:2b"],
+  "tight": ["mistral:7b"]
+}
