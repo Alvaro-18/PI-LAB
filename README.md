@@ -17,7 +17,8 @@ Há **uma única rota de chat** (`POST /chat`); as mitigações são ligadas e d
 ## Estrutura
 
 ```
-app/            backend (FastAPI): main.py, pipeline.py, mitigations.py, prompts.py, ollama_client.py
+app/            backend (FastAPI): main.py, pipeline.py, mitigations.py, prompts.py, ollama_client.py, live.py
+front/          frontend (HTML/CSS/JS puro), servido pela API em /ui
 payloads/       payloads.json (ataques com split dev/test e benignos)
 experiments/    run_experiments.py (coleta) e analyze_results.py (métricas)
 scripts/        pull_models.sh
@@ -96,6 +97,30 @@ curl -s localhost:8000/chat -H "Content-Type: application/json" -d '{
 
 Campos da resposta: `leaked`, `leak_kind`, `raw_leaked` (o LLM vazou mesmo que o filtro de saída tenha escondido), `refused`,
 `blocked_by` e `trace`. `GET /payloads` devolve o banco de ataques.
+
+## 4.1 Frontend (testes manuais e experimento ao vivo)
+
+Com a API no ar, abra **http://localhost:8000/** (redireciona para `/ui/`). Não precisa de build nem de npm.
+
+- **Chat manual:** o painel lateral define o que vai em cada `POST /chat`: modelo-alvo (lista os modelos baixados no Ollama),
+  modelo do guard, temperatura, seed e as 4 mitigações. Os botões `baseline`, `input_filter`, …, `all` aplicam as mesmas
+  combinações do runner. Em "Ataques prontos" você escolhe um payload do banco e o texto vai para a caixa de mensagem.
+  Cada resposta mostra o resultado (vazou, bloqueado, recusou, respondeu ou erro), a camada que bloqueou,
+  se o LLM vazou antes do filtro de saída e o `trace` do pipeline.
+- **Experimento ao vivo:** com a API rodando, qualquer `python -m experiments.run_experiments ...` publica cada
+  mensagem e cada resposta em `POST /events`. A aba mostra o progresso, contadores e ASR parcial, e tem filtros por config e por resultado.
+  Sem a API, o runner roda igual (só avisa que o feed está desligado). Para desligar o feed: `--no-live`.
+  Para outra URL: `--live-url` ou `PI_LIVE_URL`.
+
+```bash
+# terminal 1
+export PI_MODEL=llama3.2:1b
+uvicorn app.main:app --reload
+# terminal 2
+python -m experiments.run_experiments --models llama3.2:1b --reps 1 --split test
+```
+
+O feed fica só na memória da API (os últimos 5000 eventos) e some quando ela reinicia. Os dados oficiais continuam nos CSVs.
 
 ## 5. Coleta
 

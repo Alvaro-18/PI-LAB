@@ -188,6 +188,24 @@ def test_api_chat_route_reports_error_when_ollama_is_down():
     assert len(c.get("/payloads").json()["attacks"]) == len(BANK["attacks"])
 
 
+def test_live_feed_store_and_api_routes():
+    from fastapi.testclient import TestClient
+    from app.live import EventStore, LivePublisher
+    from app.main import app
+    st = EventStore(maxlen=3)
+    for i in range(5):
+        st.add({"type": "exec", "n": i})
+    assert [e["n"] for e in st.since(0)] == [2, 3, 4] and [e["n"] for e in st.since(4)] == [4]
+    assert not LivePublisher("http://127.0.0.1:9").connect()  # API fora do ar: runner segue sem feed
+    c = TestClient(app)
+    c.delete("/events")
+    c.post("/events", json={"type": "exec_start", "key": "k"})
+    c.post("/events", json={"type": "exec", "key": "k", "outcome": "leaked"})
+    d = c.get("/events", params={"after": 1}).json()
+    assert d["last_id"] == 2 and [e["type"] for e in d["events"]] == ["exec"]
+    assert c.get("/ui/").status_code == 200 and "PI-LAB" in c.get("/ui/").text
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

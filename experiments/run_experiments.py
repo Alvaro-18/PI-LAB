@@ -13,15 +13,19 @@ Desenho do experimento
     o mesmo prompt com a mesma seed, a resposta é reaproveitada. Isso reduz o tempo de coleta em cerca de 3x sem alterar
     o resultado (a saída do modelo é a mesma que seria gerada de novo).
   * Cada linha é gravada assim que fica pronta; com --resume uma coleta interrompida continua de onde parou.
+  * Feed ao vivo: se a API estiver no ar (uvicorn app.main:app), cada mensagem e resposta aparece no frontend
+    (http://localhost:8000/ui, aba "Experimento ao vivo"). Sem a API, a coleta roda igual. Desligue com --no-live.
 """
 import argparse
 import csv
 import json
+import os
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from app import config, ollama_client
+from app.live import LivePublisher
 from app.pipeline import run_chat
 from app.schemas import ChatRequest, Mitigations
 from experiments import analyze_results
@@ -99,6 +103,9 @@ def main(argv=None, chat_impl: Optional[Callable] = None) -> list[Path]:
     ap.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
     ap.add_argument("--resume", action="store_true", help="continua uma coleta com o mesmo --run-id")
     ap.add_argument("--out", default=str(ROOT / "results"))
+    ap.add_argument("--live-url", default=os.getenv("PI_LIVE_URL", "http://localhost:8000"),
+                    help="API que recebe o feed ao vivo para o frontend")
+    ap.add_argument("--no-live", action="store_true", help="não publicar o feed ao vivo")
     args = ap.parse_args(argv)
 
     names = [c.strip() for c in args.configs.split(",") if c.strip()]
@@ -128,9 +135,21 @@ def main(argv=None, chat_impl: Optional[Callable] = None) -> list[Path]:
     print(f"{len(models)} modelo(s) | {len(attacks)} ataques + {len(benign)} benignos | {len(names)} configs | "
           f"{args.reps} reps | {per_model_total} execuções por modelo | run-id={args.run_id}")
 
+    # Em testes (chat_impl simulado) o feed só liga se --live-url for passado explicitamente.
+    live = LivePublisher(None if args.no_live or (not real and "--live-url" not in (argv or [])) else args.live_url)
+    if live.connect():
+        print(f"Feed ao vivo: {args.live_url}/ui  (aba 'Experimento ao vivo')")
+    elif live.url:
+        print(f"(feed ao vivo desligado: API não encontrada em {live.url}; suba com `uvicorn app.main:app`)")
+    live.publish({"type": "run_start", "run_id": args.run_id, "models": models, "configs": names,
+                  "split": args.split, "reps": args.reps, "temperature": args.temperature,
+                  "n_attacks": len(attacks), "n_benign": len(benign), "per_model_total": per_model_total})
+
     for model in models:
         if real and not ollama_client.is_available(model, installed):
             print(f"!! {model} não está baixado. Rode: ollama pull {model}  (pulando)")
+            live.publish({"type": "model_skipped", "run_id": args.run_id, "model": model,
+                          "reason": f"não está baixado (ollama pull {model})"})
             continue
         guard = model if args.guard_model == "same" else args.guard_model
         safe = model.replace(":", "_").replace("/", "_")
@@ -145,6 +164,9 @@ def main(argv=None, chat_impl: Optional[Callable] = None) -> list[Path]:
         t0, n_done = time.time(), 0
         todo = per_model_total - len(done)
         print(f"\n### {model} (guard={guard}) -> {path.name}" + (f" | retomando, faltam {todo}" if done else ""))
+        live.publish({"type": "model_start", "run_id": args.run_id, "model": model, "guard": guard,
+                      "total": todo, "file": path.name})
+        counts: dict[str, int] = {}
 
         with path.open("w" if new_file else "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -157,14 +179,29 @@ def main(argv=None, chat_impl: Optional[Callable] = None) -> list[Path]:
                         if (cfg_name, kind, item["id"], rep) in done:
                             continue
                         seed = args.seed_base + rep
+                        key = f"{args.run_id}|{model}|{cfg_name}|{kind}|{item['id']}|{rep}"
+                        base = {"run_id": args.run_id, "key": key, "model": model, "guard": guard,
+                                "config": cfg_name, "mitigations": mit.model_dump(), "kind": kind,
+                                "payload_id": item["id"], "category": item.get("category", "benign"),
+                                "split": item.get("split", "dev"), "rep": rep, "seed": seed,
+                                "message": item["text"], "progress": n_done + 1, "total": todo}
+                        live.publish({"type": "exec_start", **base})
+                        hits_before, t_exec = cached.hits, time.time()
                         res = run_chat(ChatRequest(message=item["text"], model=model, guard_model=guard,
                                                    temperature=args.temperature, seed=seed, mitigations=mit),
                                        chat_fn=cached)
+                        out = outcome(res)
+                        counts[out] = counts.get(out, 0) + 1
+                        live.publish({"type": "exec", **base, "outcome": out, "response": res.response,
+                                      "blocked_by": res.blocked_by, "leak_kind": res.leak_kind,
+                                      "raw_leaked": res.raw_leaked, "refused": res.refused, "error": res.error,
+                                      "trace": res.trace, "cached": cached.hits > hits_before,
+                                      "elapsed_ms": int((time.time() - t_exec) * 1000)})
                         w.writerow({
                             "model": model, "run_id": args.run_id, "split": item.get("split", "dev"),
                             "config": cfg_name, "kind": kind, "payload_id": item["id"],
                             "category": item.get("category", "benign"), "rep": rep, "seed": seed,
-                            "outcome": outcome(res), "blocked_by": res.blocked_by or "",
+                            "outcome": out, "blocked_by": res.blocked_by or "",
                             "leak_kind": res.leak_kind or "", "raw_leaked": int(res.raw_leaked),
                             "error": res.error or "", "response": res.response.replace("\n", " ")[:500],
                         })
@@ -175,6 +212,8 @@ def main(argv=None, chat_impl: Optional[Callable] = None) -> list[Path]:
                             print(f"[{n_done}/{todo}] {cfg_name:<16} chamadas={cached.calls} reaproveitadas={cached.hits} "
                                   f"faltam ~{fmt_eta(rate * (todo - n_done))}", flush=True)
         written.append(path)
+        live.publish({"type": "model_end", "run_id": args.run_id, "model": model, "counts": counts,
+                      "elapsed_s": int(time.time() - t0)})
         if real:
             ollama_client.unload(model)
             if guard != model:
@@ -183,6 +222,8 @@ def main(argv=None, chat_impl: Optional[Callable] = None) -> list[Path]:
     if written:
         print("\n######## RESUMO ########")
         analyze_results.analyze_paths(written, out_dir / f"consolidated_{args.run_id}.csv")
+    live.publish({"type": "run_end", "run_id": args.run_id, "files": [p.name for p in written]})
+    live.close()
     return written
 
 
